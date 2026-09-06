@@ -6,6 +6,16 @@ CREATE TABLE IF NOT EXISTS teachers (
     abbrev VARCHAR(2) PRIMARY KEY,
     name VARCHAR(100)
 );
+ALTER TABLE teachers ADD COLUMN IF NOT EXISTS email TEXT;
+ALTER TABLE teachers ADD COLUMN IF NOT EXISTS room VARCHAR(20);
+ALTER TABLE teachers ADD COLUMN IF NOT EXISTS phone_number TEXT;
+CREATE TABLE IF NOT EXISTS consultation (
+    id BIGSERIAL PRIMARY KEY,
+    teacher VARCHAR(2) NOT NULL UNIQUE REFERENCES teachers(abbrev),
+    hours TEXT,
+    room VARCHAR(20)
+);
+ALTER TABLE teachers ADD COLUMN IF NOT EXISTS consultation BIGINT UNIQUE REFERENCES consultation(id);
 CREATE TABLE IF NOT EXISTS subjects (
     abbrev VARCHAR(10) PRIMARY KEY,
     name VARCHAR(100)
@@ -47,8 +57,12 @@ def save_snapshot(snapshot, database_url):
     with psycopg.connect(database_url, connect_timeout=30) as connection:
         with connection.cursor() as cursor:
             cursor.execute(SCHEMA)
-            cursor.execute("TRUNCATE TABLE substitutions, timetable, classes, subjects, teachers RESTART IDENTITY")
-            cursor.executemany("INSERT INTO teachers (abbrev, name) VALUES (%s, %s)", snapshot["teachers"])
+            cursor.execute("TRUNCATE TABLE substitutions, timetable, classes, subjects RESTART IDENTITY")
+            cursor.executemany(
+                """INSERT INTO teachers (abbrev, name) VALUES (%s, %s)
+                   ON CONFLICT (abbrev) DO UPDATE SET name = COALESCE(EXCLUDED.name, teachers.name)""",
+                snapshot["teachers"],
+            )
             cursor.executemany("INSERT INTO subjects (abbrev, name) VALUES (%s, %s)", snapshot["subjects"])
             cursor.executemany("INSERT INTO classes (code, class_teacher, home_classroom) VALUES (%s, %s, %s)", snapshot["classes"])
             cursor.executemany(
@@ -61,3 +75,31 @@ def save_snapshot(snapshot, database_url):
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 snapshot["substitutions"],
             )
+
+
+def save_contacts(contacts, database_url):
+    if not contacts or len({contact["abbrev"] for contact in contacts}) != len(contacts):
+        raise ValueError("Missing or duplicate teacher contacts")
+    with psycopg.connect(database_url, connect_timeout=30) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(SCHEMA)
+            for contact in contacts:
+                cursor.execute(
+                    """INSERT INTO teachers (abbrev, name, email, room, phone_number)
+                       VALUES (%s, %s, %s, %s, %s)
+                       ON CONFLICT (abbrev) DO UPDATE SET
+                           name = EXCLUDED.name, email = EXCLUDED.email,
+                           room = EXCLUDED.room, phone_number = EXCLUDED.phone_number""",
+                    (contact["abbrev"], contact["name"], contact["email"], contact["room"], contact["phone_number"]),
+                )
+                cursor.execute(
+                    """INSERT INTO consultation (teacher, hours, room) VALUES (%s, %s, %s)
+                       ON CONFLICT (teacher) DO UPDATE SET hours = EXCLUDED.hours, room = EXCLUDED.room
+                       RETURNING id""",
+                    (contact["abbrev"], contact["consultation"]["hours"], contact["consultation"]["room"]),
+                )
+                consultation_id = cursor.fetchone()[0]
+                cursor.execute(
+                    "UPDATE teachers SET consultation = %s WHERE abbrev = %s",
+                    (consultation_id, contact["abbrev"]),
+                )

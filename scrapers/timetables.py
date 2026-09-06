@@ -1,9 +1,12 @@
 import argparse
+import logging
 import os
 import re
 
 import scrapy
 from scrapy.crawler import CrawlerProcess
+
+from scrapers.logging_setup import logged_run
 
 from database import save_snapshot
 
@@ -260,31 +263,38 @@ class TimetableSpider(scrapy.Spider):
 
     def parse(self, response):
         self.pages[response.url] = parse_page(response)
+        self.logger.info("Parsed %d class timetables from %s", len(self.pages[response.url]["timetables"]), response.url)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Replace the SSŠVT PostgreSQL timetable snapshot after a successful scrape.")
     parser.parse_args()
+    with logged_run("timetables"):
+        scrape()
+
+
+def scrape():
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
-        parser.exit(1, "Set DATABASE_URL to a PostgreSQL connection string.\n")
-    process = CrawlerProcess()
+        raise RuntimeError("Set DATABASE_URL to a PostgreSQL connection string.")
+    process = CrawlerProcess(install_root_handler=False)
     crawler = process.create_crawler(TimetableSpider)
     process.crawl(crawler)
     process.start()
     pages = crawler.spider.pages if crawler.spider else {}
     stats = crawler.stats.get_stats()
     if set(pages) != {REGULAR_URL, SOURCE_URL} or stats.get("finish_reason") != "finished" or stats.get("log_count/ERROR", 0):
-        parser.exit(1, "Scrape failed; the database was not changed.\n")
+        raise RuntimeError("Scrape failed; the database was not changed.")
     try:
         snapshot = build_snapshot(pages[REGULAR_URL], pages[SOURCE_URL])
     except ValueError as error:
-        parser.exit(1, f"Validation failed; the database was not changed: {error}\n")
+        raise RuntimeError(f"Validation failed; the database was not changed: {error}") from error
     try:
+        logging.getLogger(__name__).info("Validation passed; saving snapshot to PostgreSQL")
         save_snapshot(snapshot, database_url)
     except Exception as error:
-        parser.exit(1, f"Database save failed ({type(error).__name__}); the transaction was not committed.\n")
-    print(f"Saved {len(snapshot['classes'])} classes, {len(snapshot['timetable'])} regular lessons and {len(snapshot['substitutions'])} substitutions to PostgreSQL.")
+        raise RuntimeError(f"Database save failed ({type(error).__name__}); the transaction was not committed.") from None
+    logging.getLogger(__name__).info(f"Saved {len(snapshot['classes'])} classes, {len(snapshot['timetable'])} regular lessons and {len(snapshot['substitutions'])} substitutions to PostgreSQL.")
 
 
 if __name__ == "__main__":
