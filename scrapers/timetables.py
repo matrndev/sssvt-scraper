@@ -65,6 +65,15 @@ def parse_lesson(group):
     }
 
 
+def parse_lessons(hour):
+    lessons = [parse_lesson(group) for group in hour.xpath("./div")]
+    if len(lessons) == 2:
+        for lunch, other in (lessons, lessons[::-1]):
+            if lunch["subject"] == "oběd" and lunch["group"] is None and other["subject"] != "oběd":
+                lunch["group"] = {1: 2, 2: 1, 3: 4, 4: 3}.get(other["group"])
+    return lessons
+
+
 def parse_timetable(table):
     heading = text(table.xpath("preceding-sibling::h2[1]"))
     if not heading.startswith("Rozvrh třídy "):
@@ -95,7 +104,7 @@ def parse_timetable(table):
             "periods": [
                 {
                     "number": period["number"],
-                    "lessons": [parse_lesson(group) for group in hour.xpath("./div")],
+                    "lessons": parse_lessons(hour),
                 }
                 for period, hour in zip(periods, hours)
             ],
