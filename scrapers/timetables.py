@@ -17,6 +17,7 @@ load_dotenv()
 SOURCE_URL = "https://www.sssvt.cz/IS/rozvrh-hodin/suplovaci/"
 REGULAR_URL = "https://www.sssvt.cz/IS/rozvrh-hodin/"
 WEEKDAYS = {"Po": 1, "Út": 2, "St": 3, "Čt": 4, "Pá": 5}
+GROUP_PARTNERS = {1: 2, 2: 1, 3: 4, 4: 3}
 
 
 def text(selector):
@@ -70,7 +71,7 @@ def parse_lessons(hour):
     if len(lessons) == 2:
         for lunch, other in (lessons, lessons[::-1]):
             if lunch["subject"] == "oběd" and lunch["group"] is None and other["subject"] != "oběd":
-                lunch["group"] = {1: 2, 2: 1, 3: 4, 4: 3}.get(other["group"])
+                lunch["group"] = GROUP_PARTNERS.get(other["group"])
     return lessons
 
 
@@ -160,6 +161,11 @@ def lesson_values(lesson):
 
 def build_substitutions(code, weekday, period, old_lessons, new_lessons):
     remaining = list(old_lessons)
+    current_groups = {lesson["group"] for lesson in new_lessons}
+    if (len(remaining) == 1 and remaining[0]["subject"] == "oběd" and remaining[0]["group"] is None
+            and current_groups and current_groups <= GROUP_PARTNERS.keys()):
+        groups = current_groups | {GROUP_PARTNERS[group] for group in current_groups}
+        remaining = [dict(remaining[0], group=group) for group in sorted(groups)]
     for lesson in new_lessons:
         if lesson["changed"]:
             continue
@@ -181,8 +187,13 @@ def build_substitutions(code, weekday, period, old_lessons, new_lessons):
             code, weekday, period, lesson["group"], "OTHER",
             *lesson_values(old), *lesson_values(lesson), lesson["text"],
         ))
-    if remaining:
-        raise ValueError(f"Missing or ambiguous changed lessons in {code}, weekday {weekday}, period {period}")
+    for old in remaining:
+        if old["group"] in current_groups:
+            raise ValueError(f"Ambiguous changed lessons in {code}, weekday {weekday}, period {period}")
+        substitutions.append((
+            code, weekday, period, old["group"], "CANCELLED",
+            *lesson_values(old), *lesson_values(None), None,
+        ))
     return substitutions
 
 
@@ -259,6 +270,7 @@ class TimetableSpider(scrapy.Spider):
         "REDIRECT_ENABLED": False,
         "METAREFRESH_ENABLED": False,
         "COOKIES_ENABLED": False,
+        "HTTPCACHE_ENABLED": False,
         "DOWNLOAD_TIMEOUT": 30,
         "RETRY_TIMES": 2,
         "USER_AGENT": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
