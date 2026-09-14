@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import re
+from copy import deepcopy
 
 import scrapy
 from scrapy.crawler import CrawlerProcess
@@ -140,6 +141,70 @@ def parse_page(response):
     return {"timetables": timetables, "teachers": teachers}
 
 
+def parse_room_page(response, room):
+    tables = response.css(".timetable.tt-room")
+    if len(tables) != 1 or text(tables.xpath("preceding-sibling::h2[1]")) != f"Rozvrh místnosti {room}":
+        raise ValueError(f"Missing or unexpected room timetable: {room}")
+    table = tables[0]
+    periods = [parse_period(hour)["number"] for hour in table.css(".header > .hour") if hour.css("strong")]
+    if not periods or len(set(periods)) != len(periods):
+        raise ValueError(f"Missing or duplicate room periods: {room}")
+    slots = {}
+    days = table.css(".day")
+    if len(days) != 5 or {text(day.css('.dayTitle')) for day in days} != set(WEEKDAYS):
+        raise ValueError(f"Missing or duplicate room weekdays: {room}")
+    for day in days:
+        weekday = WEEKDAYS[text(day.css(".dayTitle"))]
+        hours = day.css(".day > .hour:not(.dayTitle)")
+        if len(hours) != len(periods):
+            raise ValueError(f"Unexpected room period count: {room}")
+        for period, hour in zip(periods, hours):
+            groups = hour.xpath("./div")
+            expected = re.search(r"\bgroup(\d+)\b", hour.attrib.get("class", ""))
+            if not expected or len(groups) != int(expected[1]) or (not groups and text(hour)):
+                raise ValueError(f"Unexpected room lesson count: {room}")
+            lessons = set()
+            for group in groups:
+                code = text(group.css(".class a"))
+                subject = text(group.css("strong"))
+                if "group" not in group.attrib.get("class", "").split() or not code or not subject:
+                    raise ValueError(f"Unrecognized room lesson layout: {room}")
+                lessons.add((code, parse_group(text(group.css(".classGroup > .group"))),
+                             subject, text(group.css(".teacher a")) or None))
+            slots[weekday, period] = lessons
+    return slots
+
+
+def reconcile_rooms(current, regular_rooms, current_rooms):
+    if not regular_rooms or regular_rooms.keys() != current_rooms.keys():
+        raise ValueError("Regular and substitution room lists differ")
+    for room in regular_rooms:
+        if regular_rooms[room].keys() != current_rooms[room].keys():
+            raise ValueError(f"Room period headers differ: {room}")
+    result = deepcopy(current)
+    for table in result["timetables"]:
+        for day in table["days"]:
+            for period in day["periods"]:
+                slot = WEEKDAYS[day["day"]], period["number"]
+                for lesson in list(period["lessons"]):
+                    room = lesson["room"]
+                    if room is None:
+                        continue
+                    if room not in current_rooms or slot not in current_rooms[room]:
+                        raise ValueError(f"Missing room coverage: {room}, {slot}")
+                    key = (table["class"], lesson["group"], *lesson_values(lesson)[:2])
+                    if key in current_rooms[room][slot]:
+                        continue
+                    if lesson["changed"] or key not in regular_rooms[room][slot]:
+                        raise ValueError(f"Conflicting class and room lesson: {key}, {slot}")
+                    if any(entry[:2] == key[:2] for slots in current_rooms.values() for entry in slots.get(slot, ())):
+                        raise ValueError(f"Unresolved room reassignment: {key}, {slot}")
+                    period["lessons"].remove(lesson)
+                    logging.getLogger(__name__).info("Room timetable confirms cancellation: %s, weekday %s, period %s, group %s, room %s",
+                                                     table["class"], *slot, lesson["group"], room)
+    return result
+
+
 def checked_text(value, limit, field, required=False):
     if value is None and not required:
         return value
@@ -161,6 +226,10 @@ def lesson_values(lesson):
 
 def build_substitutions(code, weekday, period, old_lessons, new_lessons):
     remaining = list(old_lessons)
+    old_lunches = [lesson for lesson in old_lessons if lesson["subject"] == "oběd"]
+    if (len(new_lessons) == 1 and new_lessons[0]["subject"] == "oběd" and new_lessons[0]["group"] is None
+            and not new_lessons[0]["changed"] and len(old_lunches) == 1):
+        new_lessons = [dict(new_lessons[0], group=old_lunches[0]["group"])]
     current_groups = {lesson["group"] for lesson in new_lessons}
     if (len(remaining) == 1 and remaining[0]["subject"] == "oběd" and remaining[0]["group"] is None
             and current_groups and current_groups <= GROUP_PARTNERS.keys()):
@@ -281,10 +350,23 @@ class TimetableSpider(scrapy.Spider):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.pages = {}
+        self.rooms = {REGULAR_URL: {}, SOURCE_URL: {}}
+        self.expected_rooms = {}
 
     def parse(self, response):
         self.pages[response.url] = parse_page(response)
         self.logger.info("Parsed %d class timetables from %s", len(self.pages[response.url]["timetables"]), response.url)
+        links = response.css('p.links a[href*="/room/"]')
+        names = [text(link) for link in links]
+        if not names or len(set(names)) != len(names):
+            raise ValueError("Missing or duplicate advertised rooms")
+        self.expected_rooms[response.url] = set(names)
+        for link, room in zip(links, names):
+            url = response.urljoin(link.attrib["href"]).split("#")[0].rstrip("/") + "/"
+            yield scrapy.Request(url, callback=self.parse_room, cb_kwargs={"source": response.url, "room": room})
+
+    def parse_room(self, response, source, room):
+        self.rooms[source][room] = parse_room_page(response, room)
 
 
 def main():
@@ -307,7 +389,11 @@ def scrape():
     if set(pages) != {REGULAR_URL, SOURCE_URL} or stats.get("finish_reason") != "finished" or stats.get("log_count/ERROR", 0):
         raise RuntimeError("Scrape failed; the database was not changed.")
     try:
-        snapshot = build_snapshot(pages[REGULAR_URL], pages[SOURCE_URL])
+        for source in (REGULAR_URL, SOURCE_URL):
+            if crawler.spider.rooms[source].keys() != crawler.spider.expected_rooms.get(source):
+                raise ValueError(f"Incomplete room scrape: {source}")
+        current = reconcile_rooms(pages[SOURCE_URL], crawler.spider.rooms[REGULAR_URL], crawler.spider.rooms[SOURCE_URL])
+        snapshot = build_snapshot(pages[REGULAR_URL], current)
     except ValueError as error:
         raise RuntimeError(f"Validation failed; the database was not changed: {error}") from error
     try:
