@@ -3,6 +3,7 @@ import logging
 import os
 import re
 from copy import deepcopy
+from urllib.parse import quote
 
 import scrapy
 from scrapy.crawler import CrawlerProcess
@@ -41,7 +42,7 @@ def parse_group(value):
     return int(match[1] or match[2])
 
 
-def parse_lesson(group):
+def parse_lesson(group, group_selector=".classGroup"):
     classes = group.attrib.get("class", "").split()
     teacher = group.css(".teacher a")
     code = text(teacher)
@@ -55,7 +56,7 @@ def parse_lesson(group):
     return {
         "subject": subject,
         "subject_name": group.css("strong").attrib.get("title", "").strip() or None,
-        "group": parse_group(text(group.css(".classGroup"))),
+        "group": parse_group(text(group.css(group_selector))),
         "teacher": {
             "code": code,
             "name": teacher.attrib.get("title", "").strip() or None,
@@ -175,7 +176,115 @@ def parse_room_page(response, room):
     return slots
 
 
-def reconcile_rooms(current, regular_rooms, current_rooms):
+def parse_teacher_page(response, teacher):
+    tables = response.css(".timetable.tt-teacher")
+    heading = text(tables.xpath("preceding-sibling::h2[1]"))
+    prefix = "Rozvrh vyučujícího "
+    if (len(tables) != 1 or not heading.startswith(prefix) or not teacher["name"]
+            or teacher_name_key(heading.removeprefix(prefix)) != teacher_name_key(teacher["name"])):
+        raise ValueError(f"Missing or unexpected teacher timetable: {teacher['code']}")
+    table = tables[0]
+    periods = [parse_period(hour)["number"] for hour in table.css(".header > .hour") if hour.css("strong")]
+    if not periods or len(set(periods)) != len(periods):
+        raise ValueError(f"Missing or duplicate teacher periods: {teacher['code']}")
+    days = table.css(".day")
+    if len(days) != 5 or {text(day.css('.dayTitle')) for day in days} != set(WEEKDAYS):
+        raise ValueError(f"Missing or duplicate teacher weekdays: {teacher['code']}")
+    slots = {}
+    for day in days:
+        weekday = WEEKDAYS[text(day.css(".dayTitle"))]
+        hours = day.css(".day > .hour:not(.dayTitle)")
+        if len(hours) != len(periods):
+            raise ValueError(f"Unexpected teacher period count: {teacher['code']}")
+        for period, hour in zip(periods, hours):
+            groups = hour.xpath("./div")
+            expected = re.search(r"\bgroup(\d+)\b", hour.attrib.get("class", ""))
+            if not expected or len(groups) != int(expected[1]) or (not groups and text(hour)):
+                raise ValueError(f"Unexpected teacher lesson count: {teacher['code']}")
+            lessons = []
+            for group in groups:
+                classes = group.attrib.get("class", "").split()
+                if "group" not in classes:
+                    raise ValueError(f"Unrecognized teacher lesson layout: {teacher['code']}")
+                if {"special", "zmena"} <= set(classes) and not text(group):
+                    continue
+                code = text(group.css(".class a"))
+                if not code or len(group.css(".class a")) != 1:
+                    raise ValueError(f"Unrecognized teacher lesson class: {teacher['code']}")
+                lesson = parse_lesson(group, ".classGroup > .group")
+                lesson.update({"class": code, "teacher": dict(teacher)})
+                lessons.append(lesson)
+            slots[weekday, period] = lessons
+    return slots
+
+
+def reconcile_teachers(regular, current, teachers):
+    advertised = {teacher["code"] for teacher in current["teachers"]}
+    if not advertised or teachers.keys() != advertised:
+        raise ValueError("Incomplete teacher scrape")
+    result = deepcopy(current)
+    current_slots = {
+        (table["class"], WEEKDAYS[day["day"]], period["number"]): period
+        for table in result["timetables"] for day in table["days"] for period in day["periods"]
+    }
+    regular_slots = {
+        (table["class"], WEEKDAYS[day["day"]], period["number"]): period["lessons"]
+        for table in regular["timetables"] for day in table["days"] for period in day["periods"]
+    }
+    expected_slots = {key[1:] for key in current_slots}
+    assignments = {key: [] for key in current_slots}
+    for teacher, slots in teachers.items():
+        if slots.keys() != expected_slots:
+            raise ValueError(f"Incomplete teacher period coverage: {teacher}")
+        for slot, lessons in slots.items():
+            if len({lesson["room"] for lesson in lessons}) > 1:
+                logging.getLogger(__name__).warning("Teacher timetable itself lists multiple rooms: %s, weekday %s, period %s",
+                                                    teacher, *slot)
+            for lesson in lessons:
+                key = (lesson["class"], *slot)
+                if key not in assignments or not lesson["teacher"] or lesson["teacher"]["code"] != teacher:
+                    raise ValueError(f"Unexpected teacher assignment: {teacher}, {key}")
+                if lesson["changed"] or any(
+                    old["group"] == lesson["group"] and old["teacher"] and old["teacher"]["code"] == teacher
+                    for old in current_slots[key]["lessons"]
+                ):
+                    assignments[key].append(lesson)
+    for key, period in current_slots.items():
+        old_lessons = period["lessons"]
+        authoritative = []
+        for group in dict.fromkeys(lesson["group"] for lesson in assignments[key]):
+            candidates = [lesson for lesson in assignments[key] if lesson["group"] == group]
+            changed = [lesson for lesson in candidates if lesson["changed"]]
+            candidates = changed or candidates
+            if len(candidates) != 1:
+                raise ValueError(f"Conflicting teachers for class group: {key}, {group}")
+            authoritative.append(candidates[0])
+        new_groups = {lesson["group"] for lesson in authoritative}
+        retained = [lesson for lesson in old_lessons
+                    if (not lesson["teacher"] or lesson["teacher"]["code"] not in teachers)
+                    and lesson["group"] not in new_groups]
+        for source in authoritative:
+            matches = [lesson for lesson in old_lessons
+                       if lesson["group"] == source["group"] and lesson_values(lesson) == lesson_values(source)]
+            if matches:
+                retained.append(matches[0])
+            else:
+                lesson = deepcopy(source)
+                lesson.pop("class")
+                lesson["changed"] = source["changed"] or not any(
+                    old["group"] == lesson["group"] and lesson_values(old) == lesson_values(lesson)
+                    for old in regular_slots.get(key, ())
+                )
+                retained.append(lesson)
+        signature = lambda lessons: sorted((repr(lesson["group"]), repr(lesson_values(lesson))) for lesson in lessons)
+        if signature(old_lessons) != signature(retained):
+            logging.getLogger(__name__).info("Teacher timetable corrects class %s, weekday %s, period %s: %s -> %s",
+                                             *key, signature(old_lessons), signature(retained))
+        period["lessons"] = retained
+    return result
+
+
+def reconcile_rooms(current, regular_rooms, current_rooms, authoritative_teachers=()):
     if not regular_rooms or regular_rooms.keys() != current_rooms.keys():
         raise ValueError("Regular and substitution room lists differ")
     for room in regular_rooms:
@@ -187,6 +296,8 @@ def reconcile_rooms(current, regular_rooms, current_rooms):
             for period in day["periods"]:
                 slot = WEEKDAYS[day["day"]], period["number"]
                 for lesson in list(period["lessons"]):
+                    if lesson["teacher"] and lesson["teacher"]["code"] in authoritative_teachers:
+                        continue
                     room = lesson["room"]
                     if room is None:
                         continue
@@ -214,7 +325,7 @@ def checked_text(value, limit, field, required=False):
 
 
 def teacher_name_key(name):
-    name = re.sub(r"\b(?:Mgr|Ing|Bc|PhDr|RNDr|PaedDr|JUDr|MUDr|PhD|DiS|CSc)\.", "", name, flags=re.I)
+    name = re.sub(r"\b(?:Mgr|MgA|Ing|Bc|PhDr|RNDr|PaedDr|JUDr|MUDr|PhD|DiS|CSc)\.", "", name, flags=re.I)
     return tuple(sorted(re.findall(r"[^\W\d_]+", name.casefold())))
 
 
@@ -352,10 +463,19 @@ class TimetableSpider(scrapy.Spider):
         self.pages = {}
         self.rooms = {REGULAR_URL: {}, SOURCE_URL: {}}
         self.expected_rooms = {}
+        self.teachers = {}
 
     def parse(self, response):
         self.pages[response.url] = parse_page(response)
         self.logger.info("Parsed %d class timetables from %s", len(self.pages[response.url]["timetables"]), response.url)
+        if response.url == SOURCE_URL:
+            links = response.css('p.links a[href*="/teacher/"]')
+            names = [text(link) for link in links]
+            if not names or any(not name for name in names) or len(set(names)) != len(names):
+                raise ValueError("Missing or duplicate advertised teachers")
+            for teacher in self.pages[response.url]["teachers"]:
+                url = REGULAR_URL + f"teacher/{quote(teacher['code'], safe='')}/suplovaci/"
+                yield scrapy.Request(url, callback=self.parse_teacher, cb_kwargs={"teacher": teacher})
         links = response.css('p.links a[href*="/room/"]')
         names = [text(link) for link in links]
         if not names or len(set(names)) != len(names):
@@ -367,6 +487,9 @@ class TimetableSpider(scrapy.Spider):
 
     def parse_room(self, response, source, room):
         self.rooms[source][room] = parse_room_page(response, room)
+
+    def parse_teacher(self, response, teacher):
+        self.teachers[teacher["code"]] = parse_teacher_page(response, teacher)
 
 
 def main():
@@ -406,7 +529,9 @@ def scrape():
         for source in (REGULAR_URL, SOURCE_URL):
             if crawler.spider.rooms[source].keys() != crawler.spider.expected_rooms.get(source):
                 raise ValueError(f"Incomplete room scrape: {source}")
-        current = reconcile_rooms(pages[SOURCE_URL], crawler.spider.rooms[REGULAR_URL], crawler.spider.rooms[SOURCE_URL])
+        current = reconcile_teachers(pages[REGULAR_URL], pages[SOURCE_URL], crawler.spider.teachers)
+        current = reconcile_rooms(current, crawler.spider.rooms[REGULAR_URL], crawler.spider.rooms[SOURCE_URL],
+                                  authoritative_teachers=crawler.spider.teachers)
         snapshot = build_snapshot(pages[REGULAR_URL], current)
     except ValueError as error:
         raise RuntimeError(f"Validation failed; the database was not changed: {error}") from error
