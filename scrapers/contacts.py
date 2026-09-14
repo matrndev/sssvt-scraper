@@ -10,7 +10,7 @@ from scrapy.crawler import CrawlerProcess
 
 from scrapers.logging_setup import logged_run
 
-from database import save_contacts
+from database import save_contacts, save_scrape_status
 
 
 load_dotenv()
@@ -107,7 +107,21 @@ def main():
     parser = argparse.ArgumentParser(description="Update SSŠVT teacher contacts and consultations in PostgreSQL.")
     parser.parse_args()
     with logged_run("contacts"):
+        run_scrape()
+
+
+def run_scrape():
+    database_url = os.environ.get("DATABASE_URL")
+    try:
         scrape()
+    except Exception:
+        if database_url:
+            try:
+                save_scrape_status(database_url, "contacts", False)
+            except Exception:
+                logging.getLogger(__name__).exception("Failed to record contacts scrape status")
+        raise
+    save_scrape_status(database_url, "contacts", True)
 
 
 def scrape():

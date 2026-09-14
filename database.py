@@ -2,6 +2,11 @@ import psycopg
 
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS system (
+    scrape_type VARCHAR PRIMARY KEY,
+    last_scrape TIMESTAMPTZ NOT NULL,
+    scrape_success BOOLEAN NOT NULL
+);
 CREATE TABLE IF NOT EXISTS teachers (
     abbrev VARCHAR(2) PRIMARY KEY,
     name VARCHAR(100)
@@ -79,6 +84,20 @@ BEGIN
     END LOOP;
 END $$;
 """
+
+
+def save_scrape_status(database_url, scrape_type, scrape_success):
+    with psycopg.connect(database_url, connect_timeout=30) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(SCHEMA)
+            cursor.execute(
+                """INSERT INTO system (scrape_type, last_scrape, scrape_success)
+                   VALUES (%s, CURRENT_TIMESTAMP, %s)
+                   ON CONFLICT (scrape_type) DO UPDATE SET
+                       last_scrape = EXCLUDED.last_scrape,
+                       scrape_success = EXCLUDED.scrape_success""",
+                (scrape_type, scrape_success),
+            )
 
 
 def save_snapshot(snapshot, database_url):

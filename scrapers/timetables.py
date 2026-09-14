@@ -9,7 +9,7 @@ from scrapy.crawler import CrawlerProcess
 
 from scrapers.logging_setup import logged_run
 
-from database import save_snapshot
+from database import save_scrape_status, save_snapshot
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -373,7 +373,21 @@ def main():
     parser = argparse.ArgumentParser(description="Replace the SSŠVT PostgreSQL timetable snapshot after a successful scrape.")
     parser.parse_args()
     with logged_run("timetables"):
+        run_scrape()
+
+
+def run_scrape():
+    database_url = os.environ.get("DATABASE_URL")
+    try:
         scrape()
+    except Exception:
+        if database_url:
+            try:
+                save_scrape_status(database_url, "timetables", False)
+            except Exception:
+                logging.getLogger(__name__).exception("Failed to record timetables scrape status")
+        raise
+    save_scrape_status(database_url, "timetables", True)
 
 
 def scrape():
